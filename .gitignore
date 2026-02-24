@@ -1,0 +1,15 @@
+# Environment — never commit real credentials
+.env
+
+# Input files — keep your JD and CV private
+jd.txt
+cv.txt
+
+# Output
+analysis_result.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/

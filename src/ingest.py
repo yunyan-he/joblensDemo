@@ -5,14 +5,15 @@ RAG ingestion pipeline for the joblensDemo project.
 
 Modes
 -----
-  Rebuild (default)
+  Update (default)  ← smart incremental, only processes changed files
     python src/ingest.py
-    Loads all docs → splits → embeds with m3e-base → persists to chroma_db.
-    Slow (re-embeds everything), but needed whenever knowledge_base changes.
+    Computes MD5 for every file in knowledge_base and compares against a stored
+    hash registry. Only new/modified files are re-embedded; deleted files are
+    removed from Chroma. Unchanged files are skipped entirely.
 
-  Query only  ← skip the full pipeline, results in seconds
+  Query only  ← instant, no embedding at all
     python src/ingest.py --query "你想搜索的内容"
-    Loads the existing chroma_db and runs a similarity search instantly.
+    Loads the existing chroma_db and runs similarity search.
     Use --top-k N  to return more than 1 result (default 1).
 
 ──────────────────────────────────────────────────────────────────────────────
@@ -38,6 +39,10 @@ from pathlib import Path
 ROOT       = Path(__file__).resolve().parent.parent
 KB_DIR     = ROOT / "data" / "knowledge_base"   # input  — put your docs here
 CHROMA_DIR = ROOT / "data" / "chroma_db"        # output — Chroma persists here
+
+# Hash registry: tracks MD5 of each indexed file to enable incremental updates.
+# Stored inside chroma_db so it stays with the vector data and is gitignored.
+HASH_FILE  = CHROMA_DIR / ".file_hashes.json"
 
 # ── 2. Chunking parameters ───────────────────────────────────────────────────
 CHUNK_SIZE    = 800
@@ -108,62 +113,84 @@ def get_loader(file_path: Path):
         raise ValueError(f"Unsupported file type: {file_path.suffix}")
 
 
-def load_and_split(kb_dir: Path) -> list:
-    """Load every supported document in kb_dir and split into chunks."""
+def load_and_split_file(file_path: Path, kb_dir: Path) -> list:
+    """Load a single file and split it into chunks. Returns chunk list."""
     from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-    print("\n[STEP 1] Loading documents …")
-    raw_docs = []
-    # rglob("*") recurses into all nested subfolders automatically
-    for file_path in sorted(kb_dir.rglob("*")):
-        if not file_path.is_file() or file_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
-            continue
-        try:
-            loader = get_loader(file_path)
-            docs = loader.load()
-            raw_docs.extend(docs)
-            # Show path relative to knowledge_base/ so nested files are obvious
-            print(f"         ✔ {file_path.relative_to(kb_dir)}  ({len(docs)} page/chunk(s))")
-        except Exception as exc:
-            print(f"         ✘ {file_path.relative_to(kb_dir)}  — skipped ({exc})")
-
-    print(f"         Total: {len(raw_docs)} document section(s) loaded.")
-
-    print("[STEP 2] Splitting text into chunks …")
+    loader = get_loader(file_path)
+    raw_docs = loader.load()
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
-        # The separators below work well for mixed Chinese/English text:
-        # Chinese sentences end with '。', paragraphs split on newlines, etc.
         separators=["\n\n", "\n", "。", "！", "？", "；", " ", ""],
     )
-    chunks = splitter.split_documents(raw_docs)
-    print(f"         Created {len(chunks)} chunk(s) total.")
-    return chunks
+    return splitter.split_documents(raw_docs)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-def build_vector_store(chunks: list, embed_model: str, persist_dir: Path):
-    """Embed the chunks and persist them to a local Chroma database."""
-    from langchain_huggingface import HuggingFaceEmbeddings
-    from langchain_community.vectorstores import Chroma
+# Hash registry helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def compute_md5(file_path: Path) -> str:
+    """Return the MD5 hex-digest of a file's binary content."""
+    import hashlib
+    h = hashlib.md5()
+    with open(file_path, "rb") as f:
+        for block in iter(lambda: f.read(65536), b""):
+            h.update(block)
+    return h.hexdigest()
 
-    print(f"\n[STEP 3] Loading embedding model '{embed_model}' …")
-    print("         (This may take a moment on first run while the model downloads.)")
-    # encode_kwargs normalise=True mirrors the training objective of m3e-base
-    embeddings = HuggingFaceEmbeddings(
-        model_name=embed_model,
+
+def load_hash_registry() -> dict[str, str]:
+    """Load the persisted {relative_path: md5} registry, or empty dict."""
+    import json
+    if HASH_FILE.exists():
+        return json.loads(HASH_FILE.read_text(encoding="utf-8"))
+    return {}
+
+
+def save_hash_registry(registry: dict[str, str]) -> None:
+    """Persist the updated registry to disk."""
+    import json
+    CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+    HASH_FILE.write_text(
+        json.dumps(registry, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Vector store helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def get_embeddings():
+    """Load the embedding model (cached by HuggingFace after first download)."""
+    from langchain_huggingface import HuggingFaceEmbeddings
+    print(f"[INFO] Loading embedding model '{EMBED_MODEL}' …")
+    return HuggingFaceEmbeddings(
+        model_name=EMBED_MODEL,
         encode_kwargs={"normalize_embeddings": True},
     )
 
-    print(f"[STEP 4] Embedding chunks and persisting to '{persist_dir}' …")
-    vector_store = Chroma.from_documents(
-        documents=chunks,
-        embedding=embeddings,
+
+def open_or_create_store(embeddings, persist_dir: Path):
+    """Open an existing Chroma store or create a new empty one."""
+    from langchain_community.vectorstores import Chroma
+    return Chroma(
         persist_directory=str(persist_dir),
+        embedding_function=embeddings,
     )
-    print(f"         ✔ Vector store saved to '{persist_dir}'.")
-    return vector_store, embeddings
+
+
+def delete_file_from_store(store, abs_source: str) -> int:
+    """
+    Remove all chunks whose 'source' metadata equals abs_source.
+    Returns the number of chunks deleted.
+    """
+    coll = store._collection
+    # Fetch IDs of all chunks belonging to this source file
+    existing = coll.get(where={"source": abs_source}, include=[])
+    ids = existing.get("ids", [])
+    if ids:
+        coll.delete(ids=ids)
+    return len(ids)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -281,18 +308,110 @@ def main() -> None:
         print("─" * 70 + "\n")
         return
 
-    # ── REBUILD MODE (default) ──────────────────────────────────────────
-    # Step 0: Validate input folder
-    ensure_knowledge_base(KB_DIR)
+def incremental_update(kb_dir: Path) -> None:
+    """
+    Incremental indexing using MD5 hashes.
 
-    # Steps 1–2: Load docs → split into chunks
-    chunks = load_and_split(KB_DIR)
+    1. Scan all files in kb_dir, compute MD5 for each.
+    2. Load hash registry from last run.
+    3. Diff:
+       - Deleted  : in registry, not on disk        → remove from Chroma
+       - Modified : on disk, hash changed            → remove old + re-embed
+       - New      : on disk, not in registry         → embed and add
+       - Unchanged: hash identical                   → skip ✔ (fast!)
+    4. Persist updated registry.
+    """
+    ensure_knowledge_base(kb_dir)
 
-    # Steps 3–4: Embed → persist to Chroma
-    vector_store, _ = build_vector_store(chunks, EMBED_MODEL, CHROMA_DIR)
+    # ─ Scan current files ────────────────────────────────────────────────────────
+    current_files: dict[str, str] = {}   # rel_path_str → md5
+    for fp in sorted(kb_dir.rglob("*")):
+        if fp.is_file() and fp.suffix.lower() in SUPPORTED_EXTENSIONS:
+            rel = str(fp.relative_to(kb_dir))
+            current_files[rel] = compute_md5(fp)
 
-    # Step 5: Quick retrieval sanity check
-    run_retrieval_test(vector_store, TEST_QUERY)
+    registry = load_hash_registry()      # rel_path_str → md5 (from last run)
+
+    # ─ Classify ───────────────────────────────────────────────────────────────────
+    to_delete  = [r for r in registry if r not in current_files]          # gone
+    to_add     = [r for r in current_files if r not in registry]          # new
+    to_update  = [
+        r for r in current_files
+        if r in registry and current_files[r] != registry[r]             # changed
+    ]
+    unchanged  = len(current_files) - len(to_add) - len(to_update)
+
+    print(f"\n  ► Unchanged : {unchanged:3d}  (skipped)")
+    print(f"  ► New       : {len(to_add):3d}")
+    print(f"  ► Modified  : {len(to_update):3d}")
+    print(f"  ► Deleted   : {len(to_delete):3d}")
+
+    needs_work = to_delete or to_add or to_update
+    if not needs_work:
+        print("\n✔ Knowledge base is up-to-date. Nothing to do.\n")
+        return
+
+    # ─ Load model & store once (only when changes exist) ─────────────────────
+    embeddings = get_embeddings()
+    store      = open_or_create_store(embeddings, CHROMA_DIR)
+
+    # ─ Process deletions (deleted + old version of modified) ────────────────
+    for rel in to_delete + to_update:
+        abs_src = str(kb_dir / rel)
+        n = delete_file_from_store(store, abs_src)
+        tag = "🗑️  Deleted" if rel in to_delete else "🔄 Modified"
+        print(f"  {tag}  {rel}  (−{n} chunks)")
+        if rel in to_delete:
+            registry.pop(rel, None)
+
+    # ─ Process additions (new + updated files) ────────────────────────────
+    for rel in to_add + to_update:
+        fp = kb_dir / rel
+        try:
+            chunks = load_and_split_file(fp, kb_dir)
+            store.add_documents(chunks)
+            registry[rel] = current_files[rel]       # update hash
+            tag = "✨ New     " if rel in to_add else "✔ Updated "
+            print(f"  {tag}  {rel}  (+{len(chunks)} chunks)")
+        except Exception as exc:
+            print(f"  ✘ FAILED   {rel}  — {exc}")
+
+    save_hash_registry(registry)
+    print(f"\n✔ Vector store updated. Registry saved to '{HASH_FILE.name}'.\n")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+def main() -> None:
+    args = parse_args()
+
+    print("=" * 70)
+    print("  joblensDemo — Knowledge Base Tool")
+    print("  Embedding model : moka-ai/m3e-base  (bilingual Chinese/English)")
+    print("=" * 70)
+
+    # ── QUERY-ONLY MODE ───────────────────────────────────────────────
+    if args.query is not None:
+        store = load_existing_store(EMBED_MODEL, CHROMA_DIR)
+        query = args.query or TEST_QUERY
+        print(f"\n[QUERY] \"{query}\"  (top {args.top_k} result(s))")
+        results = store.similarity_search(query, k=args.top_k)
+        if not results:
+            print("[WARNING] No results returned — the index may be empty.")
+            return
+        for i, doc in enumerate(results, 1):
+            source  = doc.metadata.get("source", "unknown")
+            page    = doc.metadata.get("page", "?")
+            snippet = doc.page_content[:400].replace("\n", " ")
+            print("\n" + "─" * 70)
+            print(f"  [{i}] {Path(source).name}  (page {page})")
+            print("─" * 70)
+            print(f"  {snippet} …")
+        print("─" * 70 + "\n")
+        return
+
+    # ── INCREMENTAL UPDATE MODE (default) ────────────────────────────────
+    incremental_update(KB_DIR)
+    run_retrieval_test(load_existing_store(EMBED_MODEL, CHROMA_DIR), TEST_QUERY)
 
 
 if __name__ == "__main__":

@@ -3,16 +3,22 @@ ingest.py
 ---------
 RAG ingestion pipeline for the joblensDemo project.
 
-Loads all supported documents from ./knowledge_base/ (.pdf, .docx, .txt, .md),
-splits the text, embeds using the bilingual (Chinese + English) model
-moka-ai/m3e-base, and persists the resulting vectors to ./chroma_db/.
+Modes
+-----
+  Rebuild (default)
+    python src/ingest.py
+    Loads all docs → splits → embeds with m3e-base → persists to chroma_db.
+    Slow (re-embeds everything), but needed whenever knowledge_base changes.
 
-A quick retrieval test is run at the end to verify cross-lingual search works.
+  Query only  ← skip the full pipeline, results in seconds
+    python src/ingest.py --query "你想搜索的内容"
+    Loads the existing chroma_db and runs a similarity search instantly.
+    Use --top-k N  to return more than 1 result (default 1).
 
 ──────────────────────────────────────────────────────────────────────────────
 PREREQUISITES — install inside the project's virtual environment:
 
-  source .venv/bin/activate          # activate the existing .venv
+  source .venv/bin/activate
 
   pip install langchain langchain-community langchain-huggingface \
               pypdf chromadb sentence-transformers docx2txt
@@ -22,12 +28,16 @@ PREREQUISITES — install inside the project's virtual environment:
 
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
-# ── 1. Paths ─────────────────────────────────────────────────────────────────
-KB_DIR     = Path("./knowledge_base")   # input  — put your PDFs here
-CHROMA_DIR = Path("./chroma_db")        # output — Chroma will persist here
+# ── 1. Project root & Paths ──────────────────────────────────────────────────
+# Anchoring to the project root (parent of src/) makes paths work correctly
+# regardless of which directory the script is launched from.
+ROOT       = Path(__file__).resolve().parent.parent
+KB_DIR     = ROOT / "data" / "knowledge_base"   # input  — put your docs here
+CHROMA_DIR = ROOT / "data" / "chroma_db"        # output — Chroma persists here
 
 # ── 2. Chunking parameters ───────────────────────────────────────────────────
 CHUNK_SIZE    = 800
@@ -182,16 +192,100 @@ def run_retrieval_test(vector_store, query: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+def load_existing_store(embed_model: str, persist_dir: Path):
+    """
+    Load the already-built Chroma vector store from disk.
+    No embedding computation — loads in a couple of seconds.
+    """
+    from langchain_huggingface import HuggingFaceEmbeddings
+    from langchain_community.vectorstores import Chroma
+
+    if not persist_dir.exists():
+        print(
+            f"\n[ERROR] Vector store not found at '{persist_dir}'.\n"
+            "        Run without --query first to build it:\n"
+            "        python src/ingest.py\n"
+        )
+        sys.exit(1)
+
+    print(f"[INFO] Loading existing vector store from '{persist_dir}' …")
+    embeddings = HuggingFaceEmbeddings(
+        model_name=embed_model,
+        encode_kwargs={"normalize_embeddings": True},
+    )
+    store = Chroma(
+        persist_directory=str(persist_dir),
+        embedding_function=embeddings,
+    )
+    print("       ✔ Vector store ready.")
+    return store
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="joblensDemo — RAG ingestion & retrieval tool",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  Rebuild vector store (needed after adding new docs):\n"
+            "    python src/ingest.py\n\n"
+            "  Query existing store (instant, no re-embedding):\n"
+            "    python src/ingest.py --query \"Python 相关技能\"\n"
+            "    python src/ingest.py --query \"machine learning\" --top-k 3\n"
+        ),
+    )
+    p.add_argument(
+        "--query", "-q",
+        metavar="TEXT",
+        default=None,
+        help="Run retrieval only against the existing DB (no rebuild).",
+    )
+    p.add_argument(
+        "--top-k", "-k",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Number of results to return in query mode (default: 1).",
+    )
+    return p.parse_args()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 def main() -> None:
+    args = parse_args()
+
     print("=" * 70)
-    print("  joblensDemo — PDF Ingestion Pipeline")
+    print("  joblensDemo — Knowledge Base Tool")
     print("  Embedding model : moka-ai/m3e-base  (bilingual Chinese/English)")
     print("=" * 70)
 
+    # ── QUERY-ONLY MODE ───────────────────────────────────────────────
+    if args.query is not None:
+        store = load_existing_store(EMBED_MODEL, CHROMA_DIR)
+        # Override k in run_retrieval_test by passing it inline
+        query = args.query or TEST_QUERY
+        print(f"\n[QUERY] \"{query}\"  (top {args.top_k} result(s))")
+        results = store.similarity_search(query, k=args.top_k)
+        if not results:
+            print("[WARNING] No results returned — the index may be empty.")
+            return
+        for i, doc in enumerate(results, 1):
+            source  = doc.metadata.get("source", "unknown")
+            page    = doc.metadata.get("page", "?")
+            snippet = doc.page_content[:400].replace("\n", " ")
+            print("\n" + "─" * 70)
+            print(f"  [{i}] {Path(source).name}  (page {page})")
+            print("─" * 70)
+            print(f"  {snippet} …")
+        print("─" * 70 + "\n")
+        return
+
+    # ── REBUILD MODE (default) ──────────────────────────────────────────
     # Step 0: Validate input folder
     ensure_knowledge_base(KB_DIR)
 
-    # Steps 1–2: Load PDFs → split into chunks
+    # Steps 1–2: Load docs → split into chunks
     chunks = load_and_split(KB_DIR)
 
     # Steps 3–4: Embed → persist to Chroma

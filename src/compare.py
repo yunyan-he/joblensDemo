@@ -75,10 +75,13 @@ ALL string values in the JSON output MUST be written in English, regardless of t
 # ---------------------------------------------------------------------------
 # 2. Defaults
 # ---------------------------------------------------------------------------
-DEFAULT_JD_PATH: str = "jd.txt"
-DEFAULT_CV_PATH: str = "cv.txt"
-DEFAULT_OUT_PATH: str = "analysis_result.json"
-DEFAULT_MODEL: str = "gpt-4o"
+# Anchor to project root (parent of src/) so paths work from any directory.
+_ROOT = Path(__file__).resolve().parent.parent
+
+DEFAULT_JD_PATH: str  = str(_ROOT / "data" / "inputs"  / "jd.txt")
+DEFAULT_CV_PATH: str  = str(_ROOT / "data" / "inputs"  / "cv.txt")
+DEFAULT_OUT_PATH: str = str(_ROOT / "data" / "outputs" / "analysis_result.json")
+DEFAULT_MODEL: str    = "gpt-4o"
 
 console = Console()
 

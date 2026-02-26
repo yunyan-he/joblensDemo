@@ -1,0 +1,19 @@
+# ── Core LLM & LangChain ────────────────────────────────────────────────────
+openai
+langchain
+langchain-community
+langchain-huggingface
+langchain-text-splitters
+
+# ── Document Loaders ─────────────────────────────────────────────────────────
+pypdf          # .pdf
+docx2txt       # .docx
+cryptography   # encrypted PDFs (AES)
+
+# ── Embeddings & Vector Store ────────────────────────────────────────────────
+sentence-transformers   # moka-ai/m3e-base
+chromadb
+
+# ── Utilities ────────────────────────────────────────────────────────────────
+python-dotenv
+rich

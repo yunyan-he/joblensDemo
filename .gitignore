@@ -8,6 +8,12 @@ cv.txt
 # Output
 analysis_result.json
 
+# RAG — personal documents (never commit)
+knowledge_base/
+
+# RAG — local vector store (auto-generated, never commit)
+chroma_db/
+
 # Python
 __pycache__/
 *.py[cod]

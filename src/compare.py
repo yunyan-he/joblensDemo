@@ -161,7 +161,7 @@ def retrieve_kb_context(jd_text: str, top_k: int = DEFAULT_TOP_K) -> str:
         return ""
 
     from langchain_huggingface import HuggingFaceEmbeddings
-    from langchain_community.vectorstores import Chroma
+    from langchain_chroma import Chroma
 
     console.print(f"[dim]Loading KB embeddings ({EMBED_MODEL}) …[/]")
     embeddings = HuggingFaceEmbeddings(

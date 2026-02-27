@@ -30,6 +30,7 @@ PREREQUISITES — install inside the project's virtual environment:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -37,8 +38,11 @@ from pathlib import Path
 # Anchoring to the project root (parent of src/) makes paths work correctly
 # regardless of which directory the script is launched from.
 ROOT       = Path(__file__).resolve().parent.parent
-KB_DIR     = ROOT / "data" / "knowledge_base"   # input  — put your docs here
-CHROMA_DIR = ROOT / "data" / "chroma_db"        # output — Chroma persists here
+
+# Env var overrides let test suites redirect to sandbox dirs without modifying
+# source code.  Production usage never sets these variables.
+KB_DIR     = Path(os.getenv("JOBLENS_KB_DIR",     str(ROOT / "data" / "knowledge_base")))
+CHROMA_DIR = Path(os.getenv("JOBLENS_CHROMA_DIR", str(ROOT / "data" / "chroma_db")))
 
 # Hash registry: tracks MD5 of each indexed file to enable incremental updates.
 # Stored inside chroma_db so it stays with the vector data and is gitignored.
@@ -172,7 +176,7 @@ def get_embeddings():
 
 def open_or_create_store(embeddings, persist_dir: Path):
     """Open an existing Chroma store or create a new empty one."""
-    from langchain_community.vectorstores import Chroma
+    from langchain_chroma import Chroma
     return Chroma(
         persist_directory=str(persist_dir),
         embedding_function=embeddings,
@@ -225,7 +229,7 @@ def load_existing_store(embed_model: str, persist_dir: Path):
     No embedding computation — loads in a couple of seconds.
     """
     from langchain_huggingface import HuggingFaceEmbeddings
-    from langchain_community.vectorstores import Chroma
+    from langchain_chroma import Chroma
 
     if not persist_dir.exists():
         print(

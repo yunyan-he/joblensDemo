@@ -13,7 +13,9 @@ cryptography   # encrypted PDFs (AES)
 # ── Embeddings & Vector Store ────────────────────────────────────────────────
 sentence-transformers   # moka-ai/m3e-base
 chromadb
+langchain-chroma
 
 # ── Utilities ────────────────────────────────────────────────────────────────
 python-dotenv
 rich
+pytest
